@@ -23,7 +23,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([make_cert/1, gen_rsa/1, verify_signature/3, write_pem/3]).
--compile(export_all).
+-export([gen_dsa/2, gen_ec/1]).
 
 %%--------------------------------------------------------------------
 %% @doc  Create and return a der encoded certificate
@@ -194,7 +194,7 @@ issuer(true, Opts, SubjectKey) ->
 issuer({Issuer, IssuerKey}, _Opts, _SubjectKey) when is_binary(Issuer) ->
     {issuer_der(Issuer), decode_key(IssuerKey)};
 issuer({File, IssuerKey}, _Opts, _SubjectKey) when is_list(File) ->
-    {ok, [{cert, Cert, _}|_]} = pem_to_der(File),
+    [{'Certificate', Cert, _}|_] = pem_to_der(File),
     {issuer_der(Cert), decode_key(IssuerKey)}.
 
 issuer_der(Issuer) ->
