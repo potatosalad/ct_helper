@@ -23,7 +23,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([make_cert/1, gen_rsa/1, verify_signature/3, write_pem/3]).
--export([gen_dsa/2]).
+-compile(export_all).
 
 %%--------------------------------------------------------------------
 %% @doc  Create and return a der encoded certificate
@@ -45,7 +45,7 @@
 %%      {dnQualifer, DnQ}
 %%   issuer = {Issuer, IssuerKey}                   true (i.e. a ca cert is created) 
 %%                                                  (obs IssuerKey migth be {Key, Password}
-%%   key = KeyFile|KeyBin|rsa|dsa                   Subject PublicKey rsa or dsa generates key
+%%   key = KeyFile|KeyBin|rsa|dsa|ec                Subject PublicKey rsa, dsa or ec generates key
 %%   
 %%
 %%   (OBS: The generated keys are for testing only)
@@ -67,7 +67,7 @@ make_cert(Opts) ->
 %%--------------------------------------------------------------------
 write_pem(Dir, FileName, {Cert, Key = {_,_,not_encrypted}}) when is_binary(Cert) ->
     ok = der_to_pem(filename:join(Dir, FileName ++ ".pem"),
-			       [{'Certificate', Cert, not_encrypted}]),
+                   [{'Certificate', Cert, not_encrypted}]),
     ok = der_to_pem(filename:join(Dir, FileName ++ "_key.pem"), [Key]).
 
 %%--------------------------------------------------------------------
@@ -91,6 +91,16 @@ gen_dsa(LSize,NSize) when is_integer(LSize), is_integer(NSize) ->
     {Key, encode_key(Key)}.
 
 %%--------------------------------------------------------------------
+%% @doc Creates a ec key (OBS: for testing only)
+%%   the sizes are in bytes
+%% @spec (::integer()) -> {::atom(), ::binary(), ::opaque()}
+%% @end
+%%--------------------------------------------------------------------
+gen_ec(Curve) when is_atom(Curve) ->
+    Key = gen_ec2(Curve),
+    {Key, encode_key(Key)}.
+
+%%--------------------------------------------------------------------
 %% @doc Verifies cert signatures
 %% @spec (::binary(), ::tuple()) -> ::boolean()
 %% @end
@@ -98,23 +108,27 @@ gen_dsa(LSize,NSize) when is_integer(LSize), is_integer(NSize) ->
 verify_signature(DerEncodedCert, DerKey, _KeyParams) ->
     Key = decode_key(DerKey),
     case Key of 
-	#'RSAPrivateKey'{modulus=Mod, publicExponent=Exp} ->
-	    public_key:pkix_verify(DerEncodedCert, 
-				   #'RSAPublicKey'{modulus=Mod, publicExponent=Exp});
-	#'DSAPrivateKey'{p=P, q=Q, g=G, y=Y} ->
-	    public_key:pkix_verify(DerEncodedCert, {Y, #'Dss-Parms'{p=P, q=Q, g=G}})
+    #'RSAPrivateKey'{modulus=Mod, publicExponent=Exp} ->
+        public_key:pkix_verify(DerEncodedCert, 
+                   #'RSAPublicKey'{modulus=Mod, publicExponent=Exp});
+    #'DSAPrivateKey'{p=P, q=Q, g=G, y=Y} ->
+        public_key:pkix_verify(DerEncodedCert, {Y, #'Dss-Parms'{p=P, q=Q, g=G}});
+    #'ECPrivateKey'{version = _Version, privateKey = _PrivKey,
+            parameters = Params, publicKey = {0, PubKey}} ->
+        public_key:pkix_verify(DerEncodedCert, {#'ECPoint'{point = PubKey}, Params})
     end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%% Implementation %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 get_key(Opts) ->
     case proplists:get_value(key, Opts) of
-	undefined -> make_key(rsa, Opts);
-	rsa ->       make_key(rsa, Opts);
-	dsa ->       make_key(dsa, Opts);
-	Key ->
-	    Password = proplists:get_value(password, Opts, no_passwd),
-	    decode_key(Key, Password)
+    undefined -> make_key(rsa, Opts);
+    rsa ->       make_key(rsa, Opts);
+    dsa ->       make_key(dsa, Opts);
+    ec ->        make_key(ec, Opts);
+    Key ->
+        Password = proplists:get_value(password, Opts, no_passwd),
+        decode_key(Key, Password)
     end.
 
 decode_key({Key, Pw}) ->
@@ -129,6 +143,8 @@ decode_key(#'RSAPrivateKey'{} = Key,_) ->
     Key;
 decode_key(#'DSAPrivateKey'{} = Key,_) ->
     Key;
+decode_key(#'ECPrivateKey'{} = Key,_) ->
+    Key;
 decode_key(PemEntry = {_,_,_}, Pw) ->
     public_key:pem_entry_decode(PemEntry, Pw);
 decode_key(PemBin, Pw) ->
@@ -137,10 +153,13 @@ decode_key(PemBin, Pw) ->
 
 encode_key(Key = #'RSAPrivateKey'{}) ->
     {ok, Der} = 'OTP-PUB-KEY':encode('RSAPrivateKey', Key),
-    {'RSAPrivateKey', iolist_to_binary(Der), not_encrypted};
+    {'RSAPrivateKey', Der, not_encrypted};
 encode_key(Key = #'DSAPrivateKey'{}) ->
     {ok, Der} = 'OTP-PUB-KEY':encode('DSAPrivateKey', Key),
-    {'DSAPrivateKey', iolist_to_binary(Der), not_encrypted}.
+    {'DSAPrivateKey', Der, not_encrypted};
+encode_key(Key = #'ECPrivateKey'{}) ->
+    {ok, Der} = 'OTP-PUB-KEY':encode('ECPrivateKey', Key),
+    {'ECPrivateKey', Der, not_encrypted}.
 
 make_tbs(SubjectKey, Opts) ->    
     Version = list_to_atom("v"++integer_to_list(proplists:get_value(version, Opts, 3))),
@@ -151,23 +170,23 @@ make_tbs(SubjectKey, Opts) ->
     {Algo, Parameters} = sign_algorithm(IssuerKey, Opts),
     
     SignAlgo = #'SignatureAlgorithm'{algorithm  = Algo,
-				     parameters = Parameters},    
+                     parameters = Parameters},    
     Subject = case IssuerProp of
-		  true -> %% Is a Root Ca
-		      Issuer;
-		  _ ->
-		      subject(proplists:get_value(subject, Opts),false)
-	      end,
+          true -> %% Is a Root Ca
+              Issuer;
+          _ ->
+              subject(proplists:get_value(subject, Opts),false)
+          end,
 
     {#'OTPTBSCertificate'{serialNumber = trunc(random:uniform()*100000000)*10000 + 1,
-			  signature    = SignAlgo,
-			  issuer       = Issuer,
-			  validity     = validity(Opts),
-			  subject      = Subject,
-			  subjectPublicKeyInfo = publickey(SubjectKey),
-			  version      = Version,
-			  extensions   = extensions(Opts)
-			 }, IssuerKey}.
+              signature    = SignAlgo,
+              issuer       = Issuer,
+              validity     = validity(Opts),
+              subject      = Subject,
+              subjectPublicKeyInfo = publickey(SubjectKey),
+              version      = Version,
+              extensions   = extensions(Opts)
+             }, IssuerKey}.
 
 issuer(true, Opts, SubjectKey) ->
     %% Self signed
@@ -187,28 +206,28 @@ issuer_der(Issuer) ->
 subject(undefined, IsRootCA) ->
     User = if IsRootCA -> "RootCA"; true -> user() end,
     Opts = [{email, User ++ "@erlang.org"},
-	    {name, User},
-	    {city, "Stockholm"},
-	    {country, "SE"},
-	    {org, "erlang"},
-	    {org_unit, "testing dep"}],
+        {name, User},
+        {city, "Stockholm"},
+        {country, "SE"},
+        {org, "erlang"},
+        {org_unit, "testing dep"}],
     subject(Opts);
 subject(Opts, _) ->
     subject(Opts).
 
 user() ->
     case os:getenv("USER") of
-	false ->
-	    "test_user";
-	User ->
-	    User
+    false ->
+        "test_user";
+    User ->
+        User
     end.
 
 subject(SubjectOpts) when is_list(SubjectOpts) ->
     Encode = fun(Opt) ->
-		     {Type,Value} = subject_enc(Opt),
-		     [#'AttributeTypeAndValue'{type=Type, value=Value}]
-	     end,
+             {Type,Value} = subject_enc(Opt),
+             [#'AttributeTypeAndValue'{type=Type, value=Value}]
+         end,
     {rdnSequence, [Encode(Opt) || Opt <- SubjectOpts]}.
 
 %% Fill in the blanks
@@ -227,43 +246,43 @@ subject_enc(Other) ->               Other.
 
 extensions(Opts) ->
     case proplists:get_value(extensions, Opts, []) of
-	false -> 
-	    asn1_NOVALUE;
-	Exts  -> 
-	    lists:flatten([extension(Ext) || Ext <- default_extensions(Exts)])
+    false -> 
+        asn1_NOVALUE;
+    Exts  -> 
+        lists:flatten([extension(Ext) || Ext <- default_extensions(Exts)])
     end.
 
 default_extensions(Exts) ->
     Def = [{key_usage,undefined}, 
-	   {subject_altname, undefined},
-	   {issuer_altname, undefined},
-	   {basic_constraints, default},
-	   {name_constraints, undefined},
-	   {policy_constraints, undefined},
-	   {ext_key_usage, undefined},
-	   {inhibit_any, undefined},
-	   {auth_key_id, undefined},
-	   {subject_key_id, undefined},
-	   {policy_mapping, undefined}],
+       {subject_altname, undefined},
+       {issuer_altname, undefined},
+       {basic_constraints, default},
+       {name_constraints, undefined},
+       {policy_constraints, undefined},
+       {ext_key_usage, undefined},
+       {inhibit_any, undefined},
+       {auth_key_id, undefined},
+       {subject_key_id, undefined},
+       {policy_mapping, undefined}],
     Filter = fun({Key, _}, D) -> lists:keydelete(Key, 1, D) end,
     Exts ++ lists:foldl(Filter, Def, Exts).
-       	
+        
 extension({_, undefined}) -> [];
 extension({basic_constraints, Data}) ->
     case Data of
-	default ->
-	    #'Extension'{extnID = ?'id-ce-basicConstraints',
-			 extnValue = #'BasicConstraints'{cA=true},
-			 critical=true};
-	false -> 
-	    [];
-	Len when is_integer(Len) ->
-	    #'Extension'{extnID = ?'id-ce-basicConstraints',
-			 extnValue = #'BasicConstraints'{cA=true, pathLenConstraint=Len},
-			 critical=true};
-	_ ->
-	    #'Extension'{extnID = ?'id-ce-basicConstraints',
-			 extnValue = Data}
+    default ->
+        #'Extension'{extnID = ?'id-ce-basicConstraints',
+             extnValue = #'BasicConstraints'{cA=true},
+             critical=true};
+    false -> 
+        [];
+    Len when is_integer(Len) ->
+        #'Extension'{extnID = ?'id-ce-basicConstraints',
+             extnValue = #'BasicConstraints'{cA=true, pathLenConstraint=Len},
+             critical=true};
+    _ ->
+        #'Extension'{extnID = ?'id-ce-basicConstraints',
+             extnValue = Data}
     end;
 extension({Id, Data, Critical}) ->
     #'Extension'{extnID = Id, extnValue = Data, critical = Critical}.
@@ -273,11 +292,18 @@ publickey(#'RSAPrivateKey'{modulus=N, publicExponent=E}) ->
     Public = #'RSAPublicKey'{modulus=N, publicExponent=E},
     Algo = #'PublicKeyAlgorithm'{algorithm= ?rsaEncryption, parameters='NULL'},
     #'OTPSubjectPublicKeyInfo'{algorithm = Algo,
-			       subjectPublicKey = Public};
+                   subjectPublicKey = Public};
 publickey(#'DSAPrivateKey'{p=P, q=Q, g=G, y=Y}) ->
     Algo = #'PublicKeyAlgorithm'{algorithm= ?'id-dsa', 
-				 parameters={params, #'Dss-Parms'{p=P, q=Q, g=G}}},
-    #'OTPSubjectPublicKeyInfo'{algorithm = Algo, subjectPublicKey = Y}.
+                 parameters={params, #'Dss-Parms'{p=P, q=Q, g=G}}},
+    #'OTPSubjectPublicKeyInfo'{algorithm = Algo, subjectPublicKey = Y};
+publickey(#'ECPrivateKey'{version = _Version,
+              privateKey = _PrivKey,
+              parameters = Params,
+              publicKey = {0, PubKey}}) ->
+    Algo = #'PublicKeyAlgorithm'{algorithm= ?'id-ecPublicKey', parameters=Params},
+    #'OTPSubjectPublicKeyInfo'{algorithm = Algo,
+                   subjectPublicKey = #'ECPoint'{point = PubKey}}.
 
 validity(Opts) ->
     DefFrom0 = calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(date())-1),
@@ -285,33 +311,44 @@ validity(Opts) ->
     {DefFrom, DefTo} = proplists:get_value(validity, Opts, {DefFrom0, DefTo0}),
     Format = fun({Y,M,D}) -> lists:flatten(io_lib:format("~w~2..0w~2..0w000000Z",[Y,M,D])) end,
     #'Validity'{notBefore={generalTime, Format(DefFrom)},
-		notAfter ={generalTime, Format(DefTo)}}.
+        notAfter ={generalTime, Format(DefTo)}}.
 
 sign_algorithm(#'RSAPrivateKey'{}, Opts) ->
     Type = case proplists:get_value(digest, Opts, sha1) of
-	       sha1 ->   ?'sha1WithRSAEncryption';
-	       sha512 -> ?'sha512WithRSAEncryption';
-	       sha384 -> ?'sha384WithRSAEncryption';
-	       sha256 -> ?'sha256WithRSAEncryption';
-	       md5    -> ?'md5WithRSAEncryption';
-	       md2    -> ?'md2WithRSAEncryption'
-	   end,
+           sha1 ->   ?'sha1WithRSAEncryption';
+           sha512 -> ?'sha512WithRSAEncryption';
+           sha384 -> ?'sha384WithRSAEncryption';
+           sha256 -> ?'sha256WithRSAEncryption';
+           md5    -> ?'md5WithRSAEncryption';
+           md2    -> ?'md2WithRSAEncryption'
+       end,
     {Type, 'NULL'};
 sign_algorithm(#'DSAPrivateKey'{p=P, q=Q, g=G}, _Opts) ->
-    {?'id-dsa-with-sha1', {params,#'Dss-Parms'{p=P, q=Q, g=G}}}.
+    {?'id-dsa-with-sha1', {params,#'Dss-Parms'{p=P, q=Q, g=G}}};
+sign_algorithm(#'ECPrivateKey'{}, Opts) ->
+    Type = case proplists:get_value(digest, Opts, sha1) of
+           sha1 ->   ?'ecdsa-with-SHA1';
+           sha512 -> ?'ecdsa-with-SHA512';
+           sha384 -> ?'ecdsa-with-SHA384';
+           sha256 -> ?'ecdsa-with-SHA256'
+       end,
+    {Type, 'NULL'}.
 
 make_key(rsa, _Opts) ->
     %% (OBS: for testing only)
     gen_rsa2(64);
 make_key(dsa, _Opts) ->
-    gen_dsa2(128, 20).  %% Bytes i.e. {1024, 160} 
+    gen_dsa2(128, 20);  %% Bytes i.e. {1024, 160}
+make_key(ec, _Opts) ->
+    %% (OBS: for testing only)
+    gen_ec2(secp256k1).
     
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% RSA key generation  (OBS: for testing only)
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 -define(SMALL_PRIMES, [65537,97,89,83,79,73,71,67,61,59,53,
-		       47,43,41,37,31,29,23,19,17,13,11,7,5,3]).
+               47,43,41,37,31,29,23,19,17,13,11,7,5,3]).
 
 gen_rsa2(Size) ->
     P = prime(Size),
@@ -322,21 +359,21 @@ gen_rsa2(Size) ->
     {D1,D2} = extended_gcd(E, Tot),
     D = erlang:max(D1,D2),
     case D < E of
-	true ->
-	    gen_rsa2(Size);
-	false ->
-	    {Co1,Co2} = extended_gcd(Q, P),
-	    Co = erlang:max(Co1,Co2),
-	    #'RSAPrivateKey'{version = 'two-prime',
-			     modulus = N,
-			     publicExponent  = E,
-			     privateExponent = D, 
-			     prime1 = P, 
-			     prime2 = Q, 
-			     exponent1 = D rem (P-1), 
-			     exponent2 = D rem (Q-1), 
-			     coefficient = Co
-			    }
+    true ->
+        gen_rsa2(Size);
+    false ->
+        {Co1,Co2} = extended_gcd(Q, P),
+        Co = erlang:max(Co1,Co2),
+        #'RSAPrivateKey'{version = 'two-prime',
+                 modulus = N,
+                 publicExponent  = E,
+                 privateExponent = D, 
+                 prime1 = P, 
+                 prime2 = Q, 
+                 exponent1 = D rem (P-1), 
+                 exponent2 = D rem (Q-1), 
+                 coefficient = Co
+                }
     end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -351,24 +388,37 @@ gen_dsa2(LSize, NSize) ->
     
     %% Choose L-bit prime modulus P such that p-1 is a multiple of q.
     case dsa_search(X0 div (2*Q*P0), P0, Q, 1000) of
-	error -> 
-	    gen_dsa2(LSize, NSize);
-	P ->	    
-	    G = crypto:mod_exp(2, (P-1) div Q, P), % Choose G a number whose multiplicative order modulo p is q.
-	    %%                 such that This may be done by setting g = h^(p-1)/q mod p, commonly h=2 is used.
-	    
-	    X = prime(20),               %% Choose x by some random method, where 0 < x < q.
-	    Y = crypto:mod_exp(G, X, P), %% Calculate y = g^x mod p.
-	    
-	    #'DSAPrivateKey'{version=0, p=P, q=Q, g=G, y=Y, x=X}
+    error -> 
+        gen_dsa2(LSize, NSize);
+    P ->        
+        G = crypto:mod_pow(2, (P-1) div Q, P), % Choose G a number whose multiplicative order modulo p is q.
+        %%                 such that This may be done by setting g = h^(p-1)/q mod p, commonly h=2 is used.
+        
+        X = prime(20),               %% Choose x by some random method, where 0 < x < q.
+        Y = crypto:mod_pow(G, X, P), %% Calculate y = g^x mod p.
+        
+        #'DSAPrivateKey'{version=0, p = P, q = Q, 
+                 g = crypto:bytes_to_integer(G), y = crypto:bytes_to_integer(Y), x = X}
     end.
     
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% EC key generation  (OBS: for testing only)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+gen_ec2(CurveId) ->
+     {PubKey, PrivKey} = crypto:generate_key(ecdh, CurveId),
+
+    #'ECPrivateKey'{version = 1,
+            privateKey = binary_to_list(PrivKey),
+            parameters = {namedCurve, pubkey_cert_records:namedCurves(CurveId)},
+            publicKey = {0, PubKey}}.
+
 %% See fips_186-3.pdf
 dsa_search(T, P0, Q, Iter) when Iter > 0 ->
     P = 2*T*Q*P0 + 1,
-    case is_prime(crypto:mpint(P), 50) of
-	true -> P;
-	false -> dsa_search(T+1, P0, Q, Iter-1)
+    case is_prime(P, 50) of
+    true -> P;
+    false -> dsa_search(T+1, P0, Q, Iter-1)
     end;
 dsa_search(_,_,_,_) -> 
     error.
@@ -377,47 +427,49 @@ dsa_search(_,_,_,_) ->
 %%%%%%% Crypto Math %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 prime(ByteSize) ->
     Rand = odd_rand(ByteSize),
-    crypto:erlint(prime_odd(Rand, 0)).
+    prime_odd(Rand, 0).
 
 prime_odd(Rand, N) ->
     case is_prime(Rand, 50) of
-	true -> 
-	    Rand;
-	false -> 
-	    NotPrime = crypto:erlint(Rand),
-	    prime_odd(crypto:mpint(NotPrime+2), N+1)
+    true -> 
+        Rand;
+    false -> 
+        prime_odd(Rand+2, N+1)
     end.
 
 %% see http://en.wikipedia.org/wiki/Fermat_primality_test
 is_prime(_, 0) -> true;
 is_prime(Candidate, Test) -> 
-    CoPrime = odd_rand(<<0,0,0,4, 10000:32>>, Candidate),
-    case crypto:mod_exp(CoPrime, Candidate, Candidate) of
-	CoPrime -> is_prime(Candidate, Test-1);
-	_       -> false
-    end.
+    CoPrime = odd_rand(10000, Candidate),
+    Result = crypto:mod_pow(CoPrime, Candidate, Candidate) ,
+    is_prime(CoPrime, crypto:bytes_to_integer(Result), Candidate, Test).
+
+is_prime(CoPrime, CoPrime, Candidate, Test) ->
+    is_prime(Candidate, Test-1);
+is_prime(_,_,_,_) ->
+    false.
 
 odd_rand(Size) ->
     Min = 1 bsl (Size*8-1),
     Max = (1 bsl (Size*8))-1,
-    odd_rand(crypto:mpint(Min), crypto:mpint(Max)).
+    odd_rand(Min, Max).
 
 odd_rand(Min,Max) ->
-    Rand = <<Sz:32, _/binary>> = crypto:rand_uniform(Min,Max),
-    BitSkip = (Sz+4)*8-1,
-    case Rand of
-	Odd  = <<_:BitSkip,  1:1>> -> Odd;
-	Even = <<_:BitSkip,  0:1>> -> 
-	    crypto:mpint(crypto:erlint(Even)+1)
+    Rand = crypto:rand_uniform(Min,Max),
+    case Rand rem 2 of
+    0 -> 
+        Rand + 1;
+    _ -> 
+        Rand
     end.
 
 extended_gcd(A, B) ->
     case A rem B of
-	0 ->
-	    {0, 1};
-	N ->
-	    {X, Y} = extended_gcd(B, N),
-	    {Y, X-Y*(A div B)}
+    0 ->
+        {0, 1};
+    N ->
+        {X, Y} = extended_gcd(B, N),
+        {Y, X-Y*(A div B)}
     end.
 
 pem_to_der(File) ->
